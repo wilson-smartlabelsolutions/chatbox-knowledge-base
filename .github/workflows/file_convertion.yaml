@@ -1,0 +1,91 @@
+name: Convert PDFs to Markdown
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "pdfs/**.pdf"
+      - "pdfs/*.pdf"
+      - "pdfs/**/*.pdf"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: convert-pdfs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  convert_files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Convert changed PDFs and commit markdown
+        run: |
+          set -euo pipefail
+          python -m pip install -r .github/workflows/scripts/requirements.txt
+
+          before="${{ github.event.before }}"
+          sha="${{ github.sha }}"
+
+          changed=()
+          removed=()
+          if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            mapfile -t changed < <(git ls-tree -r --name-only "$sha" | grep -Ei '^pdfs/.*\.pdf$' || true)
+          else
+            mapfile -t changed < <(git diff --name-only --diff-filter=AM "$before" "$sha" -- pdfs | grep -Ei '\.pdf$' || true)
+            mapfile -t removed < <(git diff --name-only --diff-filter=D "$before" "$sha" -- pdfs | grep -Ei '\.pdf$' || true)
+          fi
+
+          if (( ${#changed[@]} + ${#removed[@]} == 0 )); then
+            echo "No PDF changes to convert."
+            exit 0
+          fi
+
+          names=()
+          if (( ${#changed[@]} )); then
+            for pdf in "${changed[@]}"; do
+              [[ -f "$pdf" ]] || continue
+              rel="${pdf#pdfs/}"
+              out="markdowns/${rel%.*}.md"
+              python .github/workflows/scripts/convert_pdf_to_md.py "$pdf" "$out"
+              names+=("$(basename "$pdf")")
+            done
+          fi
+
+          if (( ${#removed[@]} )); then
+            for pdf in "${removed[@]}"; do
+              rel="${pdf#pdfs/}"
+              stem="${rel%.*}"
+              md="markdowns/${stem}.md"
+              if [[ -f "$md" ]]; then
+                git rm -f -- "$md"
+                names+=("removed $(basename "$pdf")")
+              fi
+            done
+          fi
+
+          git add markdowns
+          if git diff --cached --quiet; then
+            echo "Markdown already matches the PDFs."
+            exit 0
+          fi
+
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -F - <<EOF
+          Convert PDFs to markdown
+
+          $(printf '%s\n' "${names[@]}")
+          EOF
+          git push
